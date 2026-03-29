@@ -1,0 +1,35 @@
+# AppArmor profile: NVIDIA GPU
+# Allows NVIDIA driver components to function normally
+
+#include <tunables/global>
+
+/usr/lib/xorg/Xorg {
+  #include <abstractions/base>
+  #include <abstractions/X>
+  #include <abstractions/video>
+
+  # NVIDIA device nodes
+  /dev/nvidia* rw,
+  /dev/nvidiactl rw,
+  /dev/nvidia-uvm rw,
+  /dev/nvidia-uvm-tools rw,
+  /dev/dri/** rw,
+
+  # NVIDIA libraries
+  /usr/lib/x86_64-linux-gnu/libnvidia* mr,
+  /usr/lib/x86_64-linux-gnu/libEGL_nvidia* mr,
+  /usr/lib/x86_64-linux-gnu/libGLX_nvidia* mr,
+  /usr/lib/x86_64-linux-gnu/libcuda* mr,
+
+  # NVIDIA config
+  /proc/driver/nvidia/** r,
+  /sys/bus/pci/devices/** r,
+  /sys/devices/** r,
+
+  # Xorg standard
+  /etc/X11/** r,
+  /usr/share/X11/** r,
+  /tmp/.X11-unix/** rw,
+  /var/log/Xorg.*.log w,
+  /run/sddm/* rw,
+}

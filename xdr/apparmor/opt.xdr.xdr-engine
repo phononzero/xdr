@@ -1,0 +1,47 @@
+# AppArmor profile: XDR Engine
+# Restricts the XDR service to only what it needs
+
+#include <tunables/global>
+
+/opt/xdr/venv/bin/python3 {
+  #include <abstractions/base>
+  #include <abstractions/python>
+  #include <abstractions/nameservice>
+
+  # XDR code and venv
+  /opt/xdr/** r,
+  /opt/xdr/venv/** rix,
+  /opt/xdr/xdr-core/** r,
+
+  # Log writing
+  /var/log/xdr/ rw,
+  /var/log/xdr/** rw,
+  /var/log/xdr/critical/** rw,
+  /var/log/xdr/general/** rw,
+
+  # eBPF operations
+  /sys/fs/bpf/ r,
+  /sys/fs/bpf/** rw,
+  /sys/kernel/btf/vmlinux r,
+  /proc/*/maps r,
+  /proc/*/status r,
+  /proc/*/comm r,
+
+  # bpftool and ip (for loading eBPF/XDP)
+  /usr/sbin/bpftool rix,
+  /usr/sbin/ip rix,
+  /sbin/ip rix,
+
+  # Desktop notifications
+  /usr/bin/notify-send rix,
+
+  # Network for Telegram alerts
+  network inet stream,
+  network inet6 stream,
+
+  # Deny everything else
+  deny /home/** rw,
+  deny /root/** rw,
+  deny /etc/shadow r,
+  deny /etc/passwd w,
+}

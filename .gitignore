@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════
+# XDR Project .gitignore
+# ═══════════════════════════════════════════════════════
+
+# ── Python ────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ── eBPF Build Artifacts ─────────────────────────────
+*.bpf.o
+vmlinux.h
+
+# ── Node.js ──────────────────────────────────────────
+node_modules/
+dist/
+
+# ── Certificates (NEVER commit) ─────────────────────
+*.pem
+*.key
+*.crt
+
+# ── Environment / Secrets ───────────────────────────
+.env
+.env.*
+.api_secret
+
+# ── IDE ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Logs / Runtime Data ─────────────────────────────
+csv_log/
+*.log
+*.csv
+
+# ── OS ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Gemini/Antigravity ──────────────────────────────
+.gemini/
+.agents/

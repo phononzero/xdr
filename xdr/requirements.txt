@@ -1,0 +1,4 @@
+# XDR Production Dependencies
+flask>=3.0
+PyJWT>=2.8
+PyYAML>=6.0

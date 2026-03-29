@@ -1,0 +1,71 @@
+# ═══════════════════════════════════════════════════════
+# XDR 통합 설정 파일 (xdr_config.yaml)
+# ═══════════════════════════════════════════════════════
+# 환경변수로 오버라이드 가능: XDR_<SECTION>_<KEY> (대문자)
+# 예: XDR_ENGINE_NIC_INTERFACE=eth0, XDR_ENGINE_DASHBOARD_PORT=8080
+
+engine:
+  # 네트워크 인터페이스 ("auto" = 자동 감지, 또는 "enp4s0", "eth0" 등 명시적 지정)
+  nic_interface: "auto"
+  # 대시보드 HTTPS 포트
+  dashboard_port: 29992
+  # XDR 설치 디렉토리
+  xdr_dir: "/opt/xdr"
+
+cache:
+  # 연결 캐시 (proc 정보가 없는 TIME-WAIT 연결 해결용)
+  conn_cache_max: 500000
+  conn_cache_ttl: 600
+  # 프로세스 캐시 (pid → exe, cmdline 매핑)
+  proc_cache_max: 1500000
+  proc_cache_ttl: 1800
+  # 메모리 이벤트 히스토리 최대 크기
+  event_history_max: 5000
+
+correlation:
+  # 이벤트 상관분석 시간 윈도우 (초)
+  window_secs: 60
+  # 프로세스 실행률 임계값 (이 값 초과 시 exec-flood 경고)
+  exec_rate_threshold: 50
+  # 연결 빈도 임계값 (이 값 초과 시 connect-flood 경고)
+  connect_rate_threshold: 100
+  # 비콘 감지 최소 횟수
+  beacon_detect_count: 10
+
+dns:
+  # DGA (Domain Generation Algorithm) 감지 파라미터
+  dga_entropy_threshold: 3.8
+  dga_consonant_ratio: 0.7
+  dga_min_length: 12
+  # DNS 터널링 감지 파라미터
+  tunnel_txt_threshold: 10
+  tunnel_subdomain_len: 40
+
+integrity:
+  # 무결성 스캔 간격 (초)
+  scan_interval_seconds: 3600
+
+threat_intel:
+  # 피드 업데이트 간격 (초)
+  update_interval: 300
+  # HTTP 요청 타임아웃 (초)
+  request_timeout: 15
+
+self_protect:
+  # 자가보호 검사 간격 (초)
+  check_interval: 120
+
+tls:
+  # TLS 인증서 경로
+  cert_file: "/opt/xdr/certs/xdr.pem"
+  key_file: "/opt/xdr/certs/xdr-key.pem"
+  # 최소 TLS 버전
+  min_version: "TLSv1.3"
+
+logging:
+  # 로그 레벨: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  # 로그 파일 경로 (null = 콘솔만)
+  file: null
+  # 최대 로그 파일 크기 (바이트)
+  max_size: 10485760  # 10MB
