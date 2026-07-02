@@ -25,7 +25,11 @@ app.config["SECRET_KEY"] = "xdr-local-only"
 blocklist_store = None
 event_history = []
 event_history_lock = Lock()
-MAX_EVENT_HISTORY = 5000
+try:
+    from config_loader import get_config as _get_cfg
+    MAX_EVENT_HISTORY = _get_cfg().get("cache", {}).get("event_history_max", 5000)
+except Exception:
+    MAX_EVENT_HISTORY = 5000
 
 # SSE subscribers
 sse_queues: list[Queue] = []
@@ -82,6 +86,8 @@ def ip_str(ip_int: int) -> str:
     if ip_int == 0:
         return "0.0.0.0"
     try:
-        return socket.inet_ntoa(struct.pack("!I", ip_int))
+        # Native pack: these ints come from eBPF (network-order bytes read as a
+        # native u32). Big-endian ('!I') would byte-reverse them.
+        return socket.inet_ntoa(struct.pack("=I", ip_int & 0xFFFFFFFF))
     except (struct.error, OSError):
         return str(ip_int)

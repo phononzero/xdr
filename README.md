@@ -1,6 +1,10 @@
-# 🛡️ XDR — eBPF 기반 Linux 통합 보안 플랫폼 [TEST VERSION v0.1]
+# 🛡️ XDR — eBPF 기반 Linux 통합 보안 플랫폼 [TEST VERSION v0.2]
 
 **eXtended Detection & Response** — eBPF EDR + XDP NDR을 단일 커널 레벨 엔진으로 통합한 Linux 보안 솔루션.
+
+> 📋 **v0.2 업데이트**: 탐지 파이프라인 전면 검증 및 버그 수정, SSL 평문 캡처 ·
+> TLS JA3 · 컨테이너 탈출 탐지 · BPF Guard · YARA 등 미완성 기능 완성. 전체 변경
+> 내역은 [UPDATE.md](UPDATE.md) 참조. (모든 탐지 능력 실제 커널 E2E 검증 완료)
 
 ---
 
@@ -43,6 +47,8 @@
 | 파일리스 악성코드 (memfd_create) | `tracepoint/syscalls/sys_enter_memfd_create` | T1620 |
 | 프로세스 인젝션 (ptrace) | `tracepoint/syscalls/sys_enter_ptrace` | T1055.008 |
 | 커널 모듈 로딩 (init_module) | `tracepoint/syscalls/sys_enter_init_module` | T1547.006 |
+| 컨테이너 탈출 — 네임스페이스 조작 | `tracepoint/syscalls/sys_enter_setns` · `sys_enter_unshare` | T1611 |
+| 컨테이너 탈출 — 파일 벡터 (docker.sock/release_agent/proc-1-root) | `lsm/file_open` (bpf_d_path 전체 경로) | T1611 |
 | 프로세스 계보 추적 + 공격 체인 | `tracepoint/sched_process_exit` | — |
 
 ### NDR (Network Detection & Response)
@@ -54,16 +60,19 @@
 | DNS 터널링 의심 | 대형 DNS 패킷 경고 |
 
 ### 상관분석 & 탐지 모듈
-- **LOLBins 탐지** — 80+ 규칙, 450+ 패턴
-- **YARA 스캐너** — 커스텀 규칙 기반 정적 분석
-- **APT Kill Chain 상관분석** — 7개 공격 시나리오
+- **LOLBins 탐지** — 124개 규칙 (366개 argv 패턴)
+- **YARA 스캐너** — 커스텀 규칙 기반 정적 분석 (기본 규칙 4종)
+- **APT Kill Chain 상관분석** — 다단계 공격 시나리오 상관
 - **DNS 모니터** — DGA 도메인 탐지, DNS 터널링
-- **TLS 핑거프린트** — JA3 해시 분석
-- **SSL 평문 감시** — OpenSSL/GnuTLS uprobe
+- **TLS 핑거프린트 (JA3)** — ClientHello 캡처 → 악성 JA3 DB 매칭
+- **SSL 평문 감시** — OpenSSL/GnuTLS uprobe(`SSL_write`/`_ex`)로 평문 내용 탐지
+- **컨테이너 탈출 탐지** — setns/unshare + 호스트 자원 접근
+- **루트킷/커널 무결성** — 숨은 프로세스·삭제 바이너리·sysctl 변조 (120초 주기)
 - **파일 무결성 모니터** — SHA256 기준선 비교
-- **메모리 포렌식 스캐너** — RWX 영역, 삭제된 매핑 탐지
+- **메모리 포렌식 스캐너** — RWX 영역, 삭제된 매핑 탐지 (60초 주기)
 - **위협 인텔리전스** — 외부 IOC 피드 자동 업데이트
-- **프로세스 계보** — 실시간 프로세스 트리 + 7개 공격 체인 패턴
+- **BPF Guard** — LSM으로 `bpf()` 접근을 XDR로만 제한 (자기보호)
+- **프로세스 계보** — 실시간 프로세스 트리 + 공격 체인 패턴
 
 ---
 

@@ -125,6 +125,15 @@ class IntegrityMonitor:
         self._load_config()
 
     def _load_config(self):
+        # 1) [integrity] section from the unified XDR config (env/YAML)
+        try:
+            from config_loader import get_config
+            _icfg = get_config().get("integrity", {})
+            if "scan_interval_seconds" in _icfg:
+                self._config["scan_interval_seconds"] = _icfg["scan_interval_seconds"]
+        except Exception:
+            pass
+        # 2) integrity's own JSON config (watch paths etc.) takes precedence
         try:
             if CONFIG_FILE.exists():
                 with open(CONFIG_FILE) as f:

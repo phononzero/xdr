@@ -10,6 +10,7 @@ Feeds captured data to EDR detector for content analysis.
 import os
 import re
 import ctypes
+import ctypes.util
 import logging
 import subprocess
 import time
@@ -20,6 +21,30 @@ from threading import Thread, Event
 # SSL event structure (must match ssl_probe.bpf.c)
 MAX_DATA_SIZE = 4096
 MAX_COMM_SIZE = 16
+
+# Compiled BPF object locations (installed first, then source tree)
+_SSL_OBJ_CANDIDATES = [
+    Path("/opt/xdr/xdr-core/ssl_probe.bpf.o"),
+    Path(__file__).resolve().parent / "ssl_probe.bpf.o",
+]
+
+# eBPF program name → (function symbol, is_uretprobe, library_group)
+# library_group: "openssl" or "gnutls" (resolved to a concrete .so at runtime)
+_SSL_PROGRAMS = [
+    ("uprobe_ssl_write",     "SSL_write",           False, "openssl"),
+    ("uretprobe_ssl_write",  "SSL_write",           True,  "openssl"),
+    ("uprobe_ssl_read",      "SSL_read",            False, "openssl"),
+    ("uretprobe_ssl_read",   "SSL_read",            True,  "openssl"),
+    # *_ex variants — CPython 3.x and modern OpenSSL apps call these instead.
+    ("uprobe_ssl_write_ex",  "SSL_write_ex",        False, "openssl"),
+    ("uretprobe_ssl_write_ex", "SSL_write_ex",      True,  "openssl"),
+    ("uprobe_ssl_read_ex",   "SSL_read_ex",         False, "openssl"),
+    ("uretprobe_ssl_read_ex", "SSL_read_ex",        True,  "openssl"),
+    ("uprobe_gnutls_send",   "gnutls_record_send",  False, "gnutls"),
+    ("uretprobe_gnutls_send", "gnutls_record_send", True,  "gnutls"),
+    ("uprobe_gnutls_recv",   "gnutls_record_recv",  False, "gnutls"),
+    ("uretprobe_gnutls_recv", "gnutls_record_recv", True,  "gnutls"),
+]
 
 
 class SSLEvent(ctypes.Structure):
@@ -33,6 +58,139 @@ class SSLEvent(ctypes.Structure):
         ("comm", ctypes.c_char * MAX_COMM_SIZE),
         ("data", ctypes.c_uint8 * MAX_DATA_SIZE),
     ]
+
+
+class SSLBpfLoader:
+    """Loads ssl_probe.bpf.o via libbpf (ctypes) and attaches SSL uprobes.
+
+    Unlike the tracefs approach — which only produces trace_pipe *metadata*
+    (comm/pid) and never the plaintext — this attaches the compiled BPF
+    programs so the kernel copies the actual SSL_write/SSL_read buffer into
+    the `ssl_events` ring buffer. Returns the ring-buffer map fd for polling.
+    """
+
+    def __init__(self):
+        self._lib = None
+        self._obj = None            # struct bpf_object *
+        self._links = []            # struct bpf_link * (keep alive = stay attached)
+        self.events_map_fd = -1
+        self._load_libbpf()
+
+    def _load_libbpf(self):
+        for name in ("libbpf.so.1", "libbpf.so"):
+            try:
+                self._lib = ctypes.CDLL(name, use_errno=True)
+                break
+            except OSError:
+                continue
+        if self._lib is None:
+            path = ctypes.util.find_library("bpf")
+            if path:
+                self._lib = ctypes.CDLL(path, use_errno=True)
+        if self._lib is None:
+            return
+        L = self._lib
+        L.bpf_object__open_file.restype = ctypes.c_void_p
+        L.bpf_object__open_file.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
+        L.bpf_object__load.restype = ctypes.c_int
+        L.bpf_object__load.argtypes = [ctypes.c_void_p]
+        L.bpf_object__find_program_by_name.restype = ctypes.c_void_p
+        L.bpf_object__find_program_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        L.bpf_program__attach_uprobe.restype = ctypes.c_void_p
+        L.bpf_program__attach_uprobe.argtypes = [
+            ctypes.c_void_p, ctypes.c_bool, ctypes.c_int,
+            ctypes.c_char_p, ctypes.c_size_t,
+        ]
+        L.bpf_object__find_map_by_name.restype = ctypes.c_void_p
+        L.bpf_object__find_map_by_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        L.bpf_map__fd.restype = ctypes.c_int
+        L.bpf_map__fd.argtypes = [ctypes.c_void_p]
+        L.bpf_object__close.restype = None
+        L.bpf_object__close.argtypes = [ctypes.c_void_p]
+        if hasattr(L, "bpf_link__destroy"):
+            L.bpf_link__destroy.restype = ctypes.c_int
+            L.bpf_link__destroy.argtypes = [ctypes.c_void_p]
+
+    @property
+    def available(self) -> bool:
+        return self._lib is not None
+
+    def load_and_attach(self, obj_path: str, openssl_lib: str | None,
+                        gnutls_lib: str | None) -> int:
+        """Load the object and attach uprobes. Returns ssl_events map fd, or -1."""
+        if not self._lib:
+            logging.error("SSL probe: libbpf not available")
+            return -1
+
+        obj = self._lib.bpf_object__open_file(obj_path.encode(), None)
+        if not obj:
+            logging.error(f"SSL probe: bpf_object__open_file failed for {obj_path}")
+            return -1
+        self._obj = obj
+
+        if self._lib.bpf_object__load(obj) != 0:
+            errno = ctypes.get_errno()
+            logging.error(f"SSL probe: bpf_object__load failed (errno={errno})")
+            self.close()
+            return -1
+
+        libs = {"openssl": openssl_lib, "gnutls": gnutls_lib}
+        attached = 0
+        for prog_name, symbol, is_ret, group in _SSL_PROGRAMS:
+            lib_path = libs.get(group)
+            if not lib_path:
+                continue
+            offset = _get_symbol_offset(lib_path, symbol)
+            if not offset or offset <= 0:
+                logging.warning(f"SSL probe: symbol {symbol} not found in {lib_path}")
+                continue
+            prog = self._lib.bpf_object__find_program_by_name(obj, prog_name.encode())
+            if not prog:
+                logging.warning(f"SSL probe: program {prog_name} not in object")
+                continue
+            # pid=-1 → attach to all processes using the library
+            link = self._lib.bpf_program__attach_uprobe(
+                prog, is_ret, -1, lib_path.encode(), offset)
+            if not link:
+                errno = ctypes.get_errno()
+                logging.warning(
+                    f"SSL probe: attach {prog_name} @ {lib_path}:0x{offset:x} "
+                    f"failed (errno={errno})")
+                continue
+            self._links.append(link)
+            attached += 1
+            logging.info(
+                f"SSL probe: attached {prog_name} @ {lib_path}:0x{offset:x}")
+
+        if attached == 0:
+            logging.warning("SSL probe: no uprobes attached")
+            self.close()
+            return -1
+
+        smap = self._lib.bpf_object__find_map_by_name(obj, b"ssl_events")
+        if not smap:
+            logging.error("SSL probe: ssl_events map not found in object")
+            self.close()
+            return -1
+        fd = self._lib.bpf_map__fd(smap)
+        self.events_map_fd = fd
+        logging.info(f"SSL probe: {attached} uprobes attached, ssl_events fd={fd}")
+        return fd
+
+    def close(self):
+        if self._lib and hasattr(self._lib, "bpf_link__destroy"):
+            for link in self._links:
+                try:
+                    self._lib.bpf_link__destroy(link)
+                except Exception:
+                    pass
+        self._links.clear()
+        if self._lib and self._obj:
+            try:
+                self._lib.bpf_object__close(self._obj)
+            except Exception:
+                pass
+            self._obj = None
 
 
 # Known library paths for OpenSSL and GnuTLS
@@ -137,6 +295,11 @@ class SSLProbe:
         self.status = "not_started"   # not_started | attached | attach_failed | error
         self.status_detail = ""
         self._attached_probes = []    # track registered probe names for cleanup
+        self._loader = None           # SSLBpfLoader (libbpf path)
+        self._rb_poller = None        # RingBufferPoller on ssl_events
+        self.mode = "none"            # "bpf_ringbuf" | "tracefs" | "none"
+        self._events_seen = 0
+        self._alerts_raised = 0
 
     def start(self):
         """Start SSL probe in background thread."""
@@ -147,9 +310,12 @@ class SSLProbe:
     def stop(self):
         """Stop SSL probe."""
         self._stop_event.set()
-        self._cleanup_probes()
+        # tracefs cleanup (no-op in ring-buffer mode)
+        if self.mode != "bpf_ringbuf":
+            self._cleanup_probes()
         if self._thread:
             self._thread.join(timeout=5)
+        # ring-buffer resources are freed inside _try_bpf_ringbuf on loop exit
 
     def _cleanup_probes(self):
         """Remove registered uprobe events."""
@@ -222,7 +388,124 @@ class SSLProbe:
             logging.debug(f"SSL probe: cleanup error: {e}")
 
     def _run(self):
-        """Main probe loop — attach uprobes and process events."""
+        """Main probe loop.
+
+        Prefer the libbpf ring-buffer path (captures real plaintext via the
+        compiled BPF programs). Only if that is unavailable (no libbpf / no
+        compiled object / attach failure) fall back to the legacy tracefs path,
+        which yields comm/pid metadata only.
+        """
+        if self._try_bpf_ringbuf():
+            return  # ring-buffer loop ran until stop
+
+        logging.warning("SSL probe: falling back to tracefs metadata mode "
+                        "(no plaintext capture)")
+        self._run_tracefs()
+
+    # ── libbpf ring-buffer path (real plaintext capture) ────
+
+    def _try_bpf_ringbuf(self) -> bool:
+        """Attempt libbpf load + ring-buffer polling. Returns True if it ran."""
+        obj_path = next((str(p) for p in _SSL_OBJ_CANDIDATES if p.exists()), None)
+        if not obj_path:
+            logging.warning("SSL probe: ssl_probe.bpf.o not found "
+                           f"(looked in {[str(p) for p in _SSL_OBJ_CANDIDATES]})")
+            return False
+
+        openssl_lib = _find_library(OPENSSL_PATHS)
+        gnutls_lib = _find_library(GNUTLS_PATHS)
+        if not openssl_lib and not gnutls_lib:
+            logging.warning("SSL probe: no OpenSSL/GnuTLS library found")
+            return False
+
+        loader = SSLBpfLoader()
+        if not loader.available:
+            logging.warning("SSL probe: libbpf unavailable — cannot use ring buffer")
+            return False
+
+        fd = loader.load_and_attach(obj_path, openssl_lib, gnutls_lib)
+        if fd < 0:
+            loader.close()
+            return False
+
+        # Attach ring buffer poller
+        try:
+            from engine.ring_buffer import RingBufferPoller
+        except Exception as e:
+            logging.error(f"SSL probe: RingBufferPoller import failed: {e}")
+            loader.close()
+            return False
+
+        poller = RingBufferPoller()
+        if not poller._lib or not poller.attach_ringbuf(fd, self._on_ssl_event):
+            logging.error("SSL probe: failed to attach ssl_events ring buffer")
+            loader.close()
+            return False
+
+        self._loader = loader
+        self._rb_poller = poller
+        self._attached = True
+        self.mode = "bpf_ringbuf"
+        self.status = "attached"
+        self.status_detail = "eBPF ring buffer 정상 작동 중 (평문 캡처)"
+        logging.info("SSL probe: eBPF ring-buffer mode active (plaintext capture)")
+
+        while not self._stop_event.is_set():
+            try:
+                poller.poll(timeout_ms=200)
+            except Exception as e:
+                logging.error(f"SSL probe: ring buffer poll error: {e}")
+                self._stop_event.wait(1)
+
+        poller.free()
+        loader.close()
+        return True
+
+    def _on_ssl_event(self, ctx, data, size) -> int:
+        """Ring-buffer callback: parse SSLEvent, feed plaintext to detector."""
+        try:
+            if size < ctypes.sizeof(SSLEvent):
+                return 0
+            evt = SSLEvent.from_buffer_copy(
+                ctypes.string_at(data, ctypes.sizeof(SSLEvent)))
+            self._events_seen += 1
+            n = min(evt.buf_filled, MAX_DATA_SIZE)
+            raw = bytes(bytearray(evt.data[:n]))
+            comm = evt.comm.decode("utf-8", "replace").rstrip("\x00")
+            event = {
+                "pid": evt.pid,
+                "tid": evt.tid,
+                "uid": evt.uid,
+                "comm": comm,
+                "direction": "write" if evt.direction == 0 else "read",
+                "data": raw,
+                "source": "SSL_PROBE",
+            }
+            if self.detector and hasattr(self.detector, "check_ssl_content"):
+                alert = self.detector.check_ssl_content(event)
+                if alert and self.push_event:
+                    alert["source"] = "SSL_PROBE"
+                    alert.setdefault("pid", evt.pid)
+                    alert.setdefault("comm", comm)
+                    self._alerts_raised += 1
+                    self.push_event(alert)
+        except Exception as e:
+            logging.debug(f"SSL probe: event parse error: {e}")
+        return 0
+
+    def get_stats(self) -> dict:
+        return {
+            "mode": self.mode,
+            "status": self.status,
+            "events_seen": self._events_seen,
+            "alerts_raised": self._alerts_raised,
+        }
+
+    # ── legacy tracefs path (metadata only, fallback) ───────
+
+    def _run_tracefs(self):
+        """Legacy fallback — attach uprobes via tracefs, parse trace_pipe."""
+        self.mode = "tracefs"
         retries = 0
         max_retries = 3
         while not self._stop_event.is_set():
@@ -231,7 +514,7 @@ class SSLProbe:
                     self._attach_probes()
                 if self._attached:
                     self.status = "attached"
-                    self.status_detail = "uprobe 정상 작동 중"
+                    self.status_detail = "uprobe 정상 작동 중 (메타데이터 전용)"
                     retries = 0
                     self._process_events()
                 else:

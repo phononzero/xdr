@@ -12,9 +12,28 @@ This package splits the monolithic edr_detector into modular components:
 
 import os
 import time
+import socket
+import struct
 import logging
 from collections import defaultdict
 from threading import Lock
+
+# EDR event type (matches engine/ebpf_structs.py)
+EVT_NET_CONNECT = 3
+
+
+def _int_to_ip(ip_int: int) -> str:
+    """Convert the raw eBPF dst_ip u32 to dotted-quad.
+
+    dst_ip holds the kernel's __be32 bytes read into a native-endian u32, so
+    it must be packed with native endianness ('=I') — see engine.utils.ip_str.
+    """
+    if not ip_int:
+        return ""
+    try:
+        return socket.inet_ntoa(struct.pack("=I", ip_int & 0xFFFFFFFF))
+    except (struct.error, OSError):
+        return ""
 
 from .policy import _load_policy, _save_policy, DEFAULT_POLICY
 from .rules import MEMFD_PATTERNS, LOLBIN_RULES, SEQUENCE_PATTERNS
@@ -272,23 +291,27 @@ class EDRDetector:
         event_type = event.get("event_type", 0)
         self.tracker.track_event(pid, event)
 
-        # Ptrace monitoring (event_type would be custom)
-        if event_type == 6:  # PTRACE event
-            ptrace_alert = check_ptrace(
-                event, self.policy, self.tracker,
-                self._should_auto_block("ptrace"),
-                self.blocker, self._ptrace_events)
-            if ptrace_alert:
-                return ptrace_alert
-
-        # C2C beacon detection (repeated connects to same IP)
-        if event_type == 3:  # NET_CONNECT
+        # C2C beacon + lateral movement detection (repeated/internal connects)
+        if event_type == EVT_NET_CONNECT:  # NET_CONNECT (3)
+            # dst_ip arrives from the ring-buffer callback as a 32-bit int.
+            # Normalize to dotted-quad so beacon dedup keys and the internal-IP
+            # check operate on strings (previously beacon keyed by raw int and
+            # lateral movement crashed on ip.split('.')).
             dst_ip = event.get("dst_ip", "")
+            if isinstance(dst_ip, int):
+                dst_ip = _int_to_ip(dst_ip)
+                event = {**event, "dst_ip": dst_ip}
             if dst_ip and dst_ip not in ("0.0.0.0", "127.0.0.1", "::"):
                 beacon_alert = check_beacon(pid, dst_ip, event,
                                             self._ip_connect_log)
                 if beacon_alert:
                     return beacon_alert
+
+                lateral_alert = check_lateral_movement(
+                    event, self.policy, self._ip_connect_log,
+                    self._should_auto_block("lateral"), self.blocker)
+                if lateral_alert:
+                    return lateral_alert
 
         return check_sequences(pid, self.tracker.get_pid_events())
 

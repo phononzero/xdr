@@ -2,3 +2,6 @@
 flask>=3.0
 PyJWT>=2.8
 PyYAML>=6.0
+# YARA static-analysis scanner (wheels bundle libyara; no system dep needed).
+# If unavailable, yara_scanner degrades gracefully (scanning disabled).
+yara-python>=4.5

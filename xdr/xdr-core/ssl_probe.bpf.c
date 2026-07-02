@@ -31,6 +31,7 @@ struct ssl_args {
     __u64 buf_ptr;        // pointer to plaintext buffer
     __u32 len;            // requested length
     __u8  direction;      // 0=write, 1=read
+    __u64 count_ptr;      // for *_ex variants: size_t* out-param with real count
 };
 
 // Maps
@@ -112,6 +113,76 @@ cleanup:
     return 0;
 }
 
+// ── *_ex entry/return: SSL_write_ex / SSL_read_ex ──────────
+// int SSL_write_ex(SSL*, const void *buf, size_t num, size_t *written)
+// int SSL_read_ex(SSL*, void *buf, size_t num, size_t *readbytes)
+// Return value is 1/0 (success), NOT the byte count — the real count is in the
+// 4th arg (size_t *out). CPython 3.x and modern OpenSSL apps use these.
+
+static __always_inline int ssl_ex_enter(void *ctx, const void *buf,
+                                        __u64 num, __u64 count_ptr,
+                                        __u8 direction)
+{
+    struct ssl_args args = {};
+    __u64 pid_tgid = get_pid_tgid();
+
+    args.buf_ptr = (__u64)buf;
+    args.len = (__u32)num;
+    args.direction = direction;
+    args.count_ptr = count_ptr;
+
+    bpf_map_update_elem(&active_ssl_args, &pid_tgid, &args, BPF_ANY);
+    return 0;
+}
+
+static __always_inline int ssl_ex_return(void *ctx, int ret)
+{
+    __u64 pid_tgid = get_pid_tgid();
+    struct ssl_args *args;
+    struct ssl_event *event;
+
+    args = bpf_map_lookup_elem(&active_ssl_args, &pid_tgid);
+    if (!args)
+        return 0;
+
+    if (ret != 1)        // _ex returns 1 on success
+        goto cleanup;
+
+    // Real byte count is in *count_ptr; fall back to requested len.
+    __u64 count = 0;
+    if (args->count_ptr)
+        bpf_probe_read_user(&count, sizeof(count), (void *)args->count_ptr);
+    if (count == 0)
+        count = args->len;
+    if (count == 0)
+        goto cleanup;
+
+    event = bpf_ringbuf_reserve(&ssl_events, sizeof(*event), 0);
+    if (!event)
+        goto cleanup;
+
+    event->pid = pid_tgid >> 32;
+    event->tid = (__u32)pid_tgid;
+    event->uid = bpf_get_current_uid_gid() >> 32;
+    event->direction = args->direction;
+    event->len = (__u32)count;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    __u32 copy_len = (__u32)count;
+    if (copy_len > MAX_DATA_SIZE)
+        copy_len = MAX_DATA_SIZE;
+    event->buf_filled = copy_len;
+
+    if (args->buf_ptr)
+        bpf_probe_read_user(&event->data, copy_len, (void *)args->buf_ptr);
+
+    bpf_ringbuf_submit(event, 0);
+
+cleanup:
+    bpf_map_delete_elem(&active_ssl_args, &pid_tgid);
+    return 0;
+}
+
 // ── SSL_read entry: capture buffer pointer (data arrives on return) ──
 
 static __always_inline int ssl_read_enter(void *ctx, void *ssl,
@@ -162,6 +233,36 @@ SEC("uretprobe/SSL_read")
 int BPF_URETPROBE(uretprobe_ssl_read, int ret)
 {
     return ssl_read_return(ctx, ret);
+}
+
+// ── OpenSSL *_ex uprobes (used by CPython 3.x, modern apps) ──
+
+// int SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)
+SEC("uprobe/SSL_write_ex")
+int BPF_UPROBE(uprobe_ssl_write_ex, void *ssl, const void *buf,
+               size_t num, size_t *written)
+{
+    return ssl_ex_enter(ctx, buf, (__u64)num, (__u64)written, 0);
+}
+
+SEC("uretprobe/SSL_write_ex")
+int BPF_URETPROBE(uretprobe_ssl_write_ex, int ret)
+{
+    return ssl_ex_return(ctx, ret);
+}
+
+// int SSL_read_ex(SSL *ssl, void *buf, size_t num, size_t *readbytes)
+SEC("uprobe/SSL_read_ex")
+int BPF_UPROBE(uprobe_ssl_read_ex, void *ssl, void *buf,
+               size_t num, size_t *readbytes)
+{
+    return ssl_ex_enter(ctx, buf, (__u64)num, (__u64)readbytes, 1);
+}
+
+SEC("uretprobe/SSL_read_ex")
+int BPF_URETPROBE(uretprobe_ssl_read_ex, int ret)
+{
+    return ssl_ex_return(ctx, ret);
 }
 
 // ── GnuTLS uprobes ────────────────────────────────────

@@ -42,6 +42,8 @@ from engine import (
     ALERT_INFO, ALERT_WARNING, ALERT_CRITICAL,
     EVT_PROCESS_EXEC, EVT_NET_CONNECT, EVT_MODULE_LOAD,
     EVT_PROCESS_EXIT, EVT_MEMFD_CREATE, EVT_PTRACE,
+    EVT_FILE_OPEN, EVT_PRIV_ESCALATION,
+    EVT_CONTAINER_ESCAPE, CE_SETNS, CE_UNSHARE,
     RingBufferPoller, get_map_fd_by_name,
     LogManager, AlertSystem, CorrelationEngine, ip_str,
 )
@@ -53,6 +55,9 @@ _cfg = _get_config()
 XDR_DIR = Path(_cfg["engine"]["xdr_dir"])
 NIC_INTERFACE = _resolve_nic(_cfg["engine"]["nic_interface"])
 DASHBOARD_PORT = _cfg["engine"]["dashboard_port"]
+_CACHE_CFG = _cfg.get("cache", {})
+_TLS_CFG = _cfg.get("tls", {})
+_LOG_CFG = _cfg.get("logging", {})
 
 shutdown_event = Event()
 
@@ -64,13 +69,20 @@ shutdown_event = Event()
 class XDREngine:
     """Main XDR engine that ties everything together."""
 
-    # Cache limits and TTL (2GB budget: ~1.5GB proc + ~0.5GB conn)
+    # Cache limits and TTL (2GB budget: ~1.5GB proc + ~0.5GB conn).
+    # Class defaults; overridden per-instance from the [cache] config section.
     CONN_CACHE_MAX = 500_000
     CONN_CACHE_TTL = 600       # 10 minutes
     PROC_CACHE_MAX = 1_500_000
     PROC_CACHE_TTL = 1800      # 30 minutes
 
     def __init__(self):
+        # Apply [cache] config overrides (fall back to class defaults)
+        self.CONN_CACHE_MAX = _CACHE_CFG.get("conn_cache_max", self.CONN_CACHE_MAX)
+        self.CONN_CACHE_TTL = _CACHE_CFG.get("conn_cache_ttl", self.CONN_CACHE_TTL)
+        self.PROC_CACHE_MAX = _CACHE_CFG.get("proc_cache_max", self.PROC_CACHE_MAX)
+        self.PROC_CACHE_TTL = _CACHE_CFG.get("proc_cache_ttl", self.PROC_CACHE_TTL)
+
         self.log_manager = LogManager()
         self.alert_system = AlertSystem()
         self.correlator = CorrelationEngine(self.log_manager, self.alert_system,
@@ -83,6 +95,8 @@ class XDREngine:
         self.lineage = ProcessLineage()
         self.rb_poller = None
         self.running = True
+        # Interface XDP/NDR is attached to (exposed for API status checks)
+        self.nic_interface = NIC_INTERFACE
 
         # eBPF event caches for enriching ss/proc results (OrderedDict for O(1) LRU eviction)
         # conn_cache: {(src_ip, src_port, dst_ip, dst_port) → info}
@@ -104,7 +118,10 @@ class XDREngine:
         self.ssl_probe = SSLProbe(edr_detector=self.detector,
                                   push_event_fn=web_dashboard.push_event)
         self.dns_monitor = DNSMonitor(push_event_fn=web_dashboard.push_event)
-        self.tls_fingerprint = TLSFingerprint(push_event_fn=web_dashboard.push_event)
+        self.tls_fingerprint = TLSFingerprint(
+            push_event_fn=web_dashboard.push_event,
+            nic_interface=NIC_INTERFACE,
+            alert_system=self.alert_system)
         self.file_audit = FileAudit(push_event_fn=web_dashboard.push_event)
         self.threat_intel = ThreatIntelFeed(
             push_event_fn=web_dashboard.push_event,
@@ -113,9 +130,21 @@ class XDREngine:
         self.self_protect = SelfProtect(push_event_fn=web_dashboard.push_event)
 
     def run(self):
+        # Log level from [logging] config (default INFO)
+        _level = getattr(logging, str(_LOG_CFG.get("level", "INFO")).upper(),
+                         logging.INFO)
+        _log_file = _LOG_CFG.get("file")
+        _handlers = None
+        if _log_file:
+            try:
+                _handlers = [logging.FileHandler(_log_file),
+                             logging.StreamHandler()]
+            except Exception:
+                _handlers = None
         logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [XDR] %(message)s"
+            level=_level,
+            format="%(asctime)s [XDR] %(message)s",
+            handlers=_handlers,
         )
         logging.info("XDR Engine starting...")
 
@@ -160,7 +189,17 @@ class XDREngine:
         self.ssl_probe.start()
         self.dns_monitor.start()
         self.file_audit.start()
-        logging.info("Phase 2 modules started: integrity, packages, ssl_probe, dns, file_audit")
+        self.tls_fingerprint.start()
+        logging.info("Phase 2 modules started: integrity, packages, ssl_probe, "
+                     "dns, file_audit, tls_fingerprint")
+
+        # Start asset scanner (kernel modules / packages / hardware drift)
+        try:
+            from api.routes_assets import init_asset_scanner
+            init_asset_scanner(push_event_fn=web_dashboard.push_event)
+            logging.info("Asset scanner started (/api/assets/scan/* active)")
+        except Exception as e:
+            logging.warning(f"Asset scanner unavailable: {e}")
 
         # Start Phase 8 threat intelligence feed
         self.threat_intel.start()
@@ -188,6 +227,12 @@ class XDREngine:
         mem_scan_thread = Thread(target=self._memory_scan_loop, daemon=True)
         mem_scan_thread.start()
         logging.info("Phase 5: Memory forensics scanner started (60s interval)")
+
+        # Start kernel integrity / rootkit scanner (hidden procs, deleted
+        # binaries, sysctl tampering, unknown modules)
+        rootkit_thread = Thread(target=self._rootkit_scan_loop, daemon=True)
+        rootkit_thread.start()
+        logging.info("Rootkit/kernel-integrity scanner started (120s interval)")
 
         # Start Flask dashboard in background thread
         dashboard_thread = Thread(target=self._run_dashboard, daemon=True)
@@ -443,9 +488,12 @@ class XDREngine:
                 return 0  # No further processing for exit events
 
             elif evt.event_type == EVT_NET_CONNECT and evt.dst_ip:
-                # Skip localhost connections (prevents beacon false positives)
+                # Skip localhost connections (prevents beacon false positives).
+                # dst_ip holds kernel __be32 bytes read as native-endian u32,
+                # so pack native ('=I') — big-endian byte-reverses the address.
                 try:
-                    ip_dotted = socket.inet_ntoa(struct.pack("!I", evt.dst_ip))
+                    ip_dotted = socket.inet_ntoa(
+                        struct.pack("=I", evt.dst_ip & 0xFFFFFFFF))
                 except Exception:
                     ip_dotted = ""
                 # Check both byte orders (eBPF may store in host or network order)
@@ -514,6 +562,51 @@ class XDREngine:
                     if event["alert_level"] >= 3:
                         self.alert_system.send(3, "SENSITIVE_FILE", event["detail"])
 
+                # Container-escape file vectors (docker.sock, cgroup
+                # release_agent, /proc/1/root, sysrq-trigger) — full path now
+                # available via bpf_d_path. Detector self-checks containerization.
+                ce_alert = self.detector.check_container_escape(event)
+                if ce_alert:
+                    ce_alert["source"] = "DETECTOR"
+                    ce_alert.setdefault("comm", comm_str)
+                    ce_alert.setdefault("pid", evt.pid)
+                    web_dashboard.push_event(ce_alert)
+                    if ce_alert.get("alert_level", 0) >= 3:
+                        self.alert_system.send(
+                            3, ce_alert.get("reason", "CONTAINER_ESCAPE"),
+                            ce_alert.get("detail", ""))
+
+            elif evt.event_type == EVT_CONTAINER_ESCAPE:
+                # Namespace manipulation (setns/unshare) — potential escape.
+                # filename carries the syscall name; dst_ip = nstype/flags.
+                syscall = fname_str or ("setns" if evt.dst_port == CE_SETNS
+                                        else "unshare")
+                ns_flags = evt.dst_ip
+                _NS = {
+                    0x00020000: "mnt", 0x20000000: "pid", 0x40000000: "net",
+                    0x04000000: "uts", 0x08000000: "ipc", 0x10000000: "user",
+                    0x02000000: "cgroup", 0x00080000: "time",
+                }
+                ns_names = ",".join(n for bit, n in _NS.items()
+                                    if ns_flags & bit) or f"0x{ns_flags:x}"
+                event["syscall"] = syscall
+                event["ns_type"] = ns_names
+                event["filename"] = ""  # not a path event
+                ce_alert = self.detector.check_container_escape(event)
+                if ce_alert:
+                    ce_alert["source"] = "DETECTOR"
+                    ce_alert.setdefault("comm", comm_str)
+                    ce_alert.setdefault("pid", evt.pid)
+                    ce_alert["detail"] = (
+                        f"{ce_alert.get('detail','')} (ns={ns_names})")
+                    web_dashboard.push_event(ce_alert)
+                    if ce_alert.get("alert_level", 0) >= 3:
+                        self.alert_system.send(
+                            3, ce_alert.get("reason", "CONTAINER_ESCAPE"),
+                            ce_alert.get("detail", ""))
+                self.correlator.process_edr_event(event)
+                return 0
+
             # ── Advanced detection pipeline ──
             # Skip detection for XDR's own child processes (prevents feedback loop)
             _self_pid = os.getpid()
@@ -524,6 +617,16 @@ class XDREngine:
                 det_result = self.detector.check_exec(event)
                 if det_result:
                     det_result["source"] = "DETECTOR"
+                    # Propagate detection reason/mitre onto the base event so the
+                    # correlation engine can categorize it for APT kill chains.
+                    # Without this, LOLBIN/reverse-shell/persistence scenarios
+                    # (correlation scenarios 5-7) never trigger.
+                    if det_result.get("reason"):
+                        event["reason"] = det_result["reason"]
+                    if det_result.get("mitre_id"):
+                        event["mitre_id"] = det_result["mitre_id"]
+                    if det_result.get("alert_level"):
+                        event["alert_level"] = det_result["alert_level"]
                     # Enrich with process info
                     det_result.setdefault("comm", comm_str)
                     det_result.setdefault("ppid", evt.ppid)
@@ -604,6 +707,22 @@ class XDREngine:
                     if evt.alert_level >= 3:
                         self.alert_system.send(3, "PTRACE_INJECTION", event["detail"])
 
+            elif evt.event_type == EVT_PRIV_ESCALATION:
+                # setuid-root / setgid escalation detected at LSM level
+                event["source"] = "DETECTOR"
+                event["reason"] = "PRIV_ESCALATION"
+                event["mitre_id"] = "T1548"
+                event["alert_level"] = 2
+                event["detail"] = (
+                    f"권한 상승 감지: {comm_str}({evt.pid}) "
+                    f"ppid={evt.ppid}({ppid_comm}) uid={evt.uid} → root "
+                    f"바이너리={fname_str}"
+                )
+                web_dashboard.push_event(event)
+                self.alert_system.send(2, "PRIV_ESCALATION", event["detail"])
+                # Also run sequence/behavioral checks
+                self.detector.check_event(event)
+
             elif evt.event_type == EVT_MODULE_LOAD:
                 # Kernel module loading detected (init_module/finit_module)
                 params_str = fname_str  # Module params stored in filename field
@@ -625,7 +744,11 @@ class XDREngine:
 
             self.correlator.process_edr_event(event)
         except Exception as e:
-            logging.debug(f"EDR callback error: {e}")
+            # Visible error logging — silent debug logging previously hid
+            # detection-pipeline failures (e.g. NameError on missing import).
+            if len(self._edr_errors) < 100:
+                self._edr_errors.append(f"{type(e).__name__}: {e}")
+            logging.error(f"EDR callback error: {type(e).__name__}: {e}")
         return 0
 
     def _activate_kernel_hardening(self):
@@ -714,7 +837,7 @@ class XDREngine:
             }
             self.correlator.process_ndr_event(event)
         except Exception as e:
-            logging.debug(f"NDR callback error: {e}")
+            logging.error(f"NDR callback error: {type(e).__name__}: {e}")
         return 0
 
     def _poll_events(self):
@@ -729,19 +852,21 @@ class XDREngine:
         """Run Flask dashboard in background thread with TLS 1.3."""
         import ssl
 
-        cert_dir = Path("/opt/xdr/certs")
-        cert_file = cert_dir / "xdr.pem"
-        key_file = cert_dir / "xdr-key.pem"
+        # Cert paths + minimum TLS version from [tls] config
+        cert_file = Path(_TLS_CFG.get("cert_file", "/opt/xdr/certs/xdr.pem"))
+        key_file = Path(_TLS_CFG.get("key_file", "/opt/xdr/certs/xdr-key.pem"))
+        _min_ver = str(_TLS_CFG.get("min_version", "TLSv1.3"))
 
         ssl_ctx = None
         if cert_file.exists() and key_file.exists():
             try:
                 ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-                try:
-                    ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-                except AttributeError:
-                    pass
+                if _min_ver == "TLSv1.3":
+                    try:
+                        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+                    except AttributeError:
+                        pass
                 ssl_ctx.load_cert_chain(str(cert_file), str(key_file))
                 logging.info("Dashboard: TLS enabled (cert: %s)", cert_file)
             except Exception as e:
@@ -797,6 +922,36 @@ class XDREngine:
             except Exception as e:
                 logging.debug(f"Memory scan error: {e}")
             shutdown_event.wait(60)  # Scan every 60 seconds
+
+    def _rootkit_scan_loop(self):
+        """Periodic kernel integrity / rootkit scan.
+
+        Detects hidden processes, deleted-binary execution, sysctl tampering
+        and (when a module allowlist is configured) unknown kernel modules.
+        """
+        shutdown_event.wait(45)  # let the system settle after startup
+        _seen = set()
+        while not shutdown_event.is_set():
+            try:
+                alerts = self.detector.check_kernel_integrity()
+                for alert in alerts:
+                    dedup_key = (alert.get("reason"), alert.get("module"),
+                                 alert.get("pid"), alert.get("detail"))
+                    if dedup_key in _seen:
+                        continue
+                    _seen.add(dedup_key)
+                    alert["source"] = "ROOTKIT"
+                    web_dashboard.push_event(alert)
+                    if alert.get("alert_level", 0) >= 2:
+                        self.alert_system.send(
+                            alert["alert_level"],
+                            alert.get("reason", "KERNEL_INTEGRITY"),
+                            alert.get("detail", ""))
+                if len(_seen) > 10000:
+                    _seen.clear()
+            except Exception as e:
+                logging.error(f"Rootkit scan error: {type(e).__name__}: {e}")
+            shutdown_event.wait(120)
 
     def _log_cleanup_loop(self):
         """Periodic log cleanup thread."""

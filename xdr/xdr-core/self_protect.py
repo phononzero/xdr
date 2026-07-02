@@ -40,8 +40,14 @@ CRITICAL_FILES = [
     "ebpf-edr/edr.bpf.o",
 ]
 
-# Check interval (seconds)
+# Check interval (seconds) — from [self_protect] config
 CHECK_INTERVAL = 120  # 2 minutes
+try:
+    from config_loader import get_config as _get_cfg
+    CHECK_INTERVAL = _get_cfg().get("self_protect", {}).get(
+        "check_interval", CHECK_INTERVAL)
+except Exception:
+    pass
 
 
 def _sha256_file(path: str) -> str:

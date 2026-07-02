@@ -21,6 +21,11 @@ EVT_PRIV_ESCALATION = 5
 EVT_PROCESS_EXIT = 6
 EVT_MEMFD_CREATE = 7
 EVT_PTRACE = 8
+EVT_CONTAINER_ESCAPE = 9
+
+# Container-escape syscall subtypes (carried in dst_port)
+CE_SETNS = 1
+CE_UNSHARE = 2
 
 EVT_NAMES = {
     1: "PROCESS_EXEC",
@@ -31,6 +36,7 @@ EVT_NAMES = {
     6: "PROCESS_EXIT",
     7: "MEMFD_CREATE",
     8: "PTRACE",
+    9: "CONTAINER_ESCAPE",
 }
 
 NDR_EVT_NAMES = {

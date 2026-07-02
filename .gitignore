@@ -40,6 +40,8 @@ dist/
 csv_log/
 *.log
 *.csv
+*.jsonl
+asset_events.jsonl
 
 # ── OS ───────────────────────────────────────────────
 .DS_Store
@@ -48,3 +50,8 @@ Thumbs.db
 # ── Gemini/Antigravity ──────────────────────────────
 .gemini/
 .agents/
+
+# ── Claude Code (AI assistant working docs) ─────────
+.claude/
+CLAUDE.md
+CLAUDE_CODEBASE.md

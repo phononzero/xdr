@@ -8,6 +8,7 @@ Compares against known malicious fingerprints database.
 
 import hashlib
 import struct
+import socket
 import logging
 import json
 import time
@@ -17,6 +18,22 @@ from pathlib import Path
 from threading import Thread, Event, Lock
 
 TLS_DATA_DIR = Path("/opt/xdr/tls")
+
+# AF_PACKET constants
+_ETH_P_IP = 0x0800
+_ETH_HDR_LEN = 14
+
+# Classic BPF filter: accept only IPv4/TCP frames (drop everything else in
+# kernel so the Python sniffer only wakes for TCP). Equivalent to tcpdump "tcp".
+#   ldh [12]; jeq 0x0800 ->; ldb [23]; jeq 6 -> accept(262144) else drop(0)
+_BPF_TCP_ONLY = [
+    (0x28, 0, 0, 0x0000000c),
+    (0x15, 0, 3, 0x00000800),
+    (0x30, 0, 0, 0x00000017),
+    (0x15, 0, 1, 0x00000006),
+    (0x06, 0, 0, 0x00040000),
+    (0x06, 0, 0, 0x00000000),
+]
 
 # ── Known malicious JA3 hashes ──────────────────────────
 # Source: ja3er.com + abuse.ch SSL blacklist
@@ -75,14 +92,138 @@ def _parse_uint8(data: bytes, offset: int) -> tuple[int, int]:
 class TLSFingerprint:
     """JA3/JA3S TLS fingerprint generator and analyzer."""
 
-    def __init__(self, push_event_fn=None):
+    def __init__(self, push_event_fn=None, nic_interface: str = "",
+                 alert_system=None):
         self.push_event = push_event_fn
+        self.nic_interface = nic_interface
+        self.alert_system = alert_system
         self._lock = Lock()
         self._fingerprints = defaultdict(list)  # JA3 -> [events]
         self._malicious_hits = []
         self._stop = Event()
+        self._thread = None
+        self._sock = None
+        self._packets_seen = 0
+        self._client_hellos = 0
+        self.status = "not_started"
 
         TLS_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Packet capture (raw AF_PACKET sniffer) ──────────────
+
+    def start(self):
+        """Start the TLS ClientHello sniffer in a background thread."""
+        self._thread = Thread(target=self._sniff_loop, daemon=True,
+                              name="tls-fingerprint")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def _open_socket(self):
+        """Open a raw AF_PACKET socket with a TCP-only cBPF filter."""
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                          socket.htons(_ETH_P_IP))
+        # Attach classic BPF so the kernel drops non-TCP before wakeup.
+        try:
+            import ctypes
+            fprog_buf = b"".join(
+                struct.pack("HBBI", code, jt, jf, k)
+                for (code, jt, jf, k) in _BPF_TCP_ONLY
+            )
+            buf = ctypes.create_string_buffer(fprog_buf)
+            # struct sock_fprog { unsigned short len; struct sock_filter *filter; }
+            fprog = struct.pack("HxxxxxxP", len(_BPF_TCP_ONLY),
+                                ctypes.addressof(buf))
+            SO_ATTACH_FILTER = 26
+            s.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER, fprog)
+            # keep buf alive for the socket's lifetime
+            self._filter_buf = buf
+        except Exception as e:
+            logging.debug(f"TLS: cBPF filter attach failed ({e}); "
+                         "falling back to Python-side filtering")
+        if self.nic_interface:
+            try:
+                s.bind((self.nic_interface, 0))
+            except OSError as e:
+                logging.warning(f"TLS: bind to {self.nic_interface} failed: {e}")
+        s.settimeout(1.0)
+        return s
+
+    def _sniff_loop(self):
+        """Capture TCP frames, extract TLS ClientHello, compute JA3."""
+        try:
+            self._sock = self._open_socket()
+        except PermissionError:
+            self.status = "no_permission"
+            logging.warning("TLS: raw socket needs root — fingerprinting disabled")
+            return
+        except OSError as e:
+            self.status = "error"
+            logging.warning(f"TLS: cannot open raw socket: {e}")
+            return
+
+        self.status = "running"
+        logging.info("TLS fingerprint: sniffing ClientHello on %s",
+                     self.nic_interface or "all interfaces")
+
+        while not self._stop.is_set():
+            try:
+                frame = self._sock.recv(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                continue
+            self._packets_seen += 1
+            try:
+                self._handle_frame(frame)
+            except Exception as e:
+                logging.debug(f"TLS frame parse error: {e}")
+
+    def _handle_frame(self, frame: bytes):
+        """Parse Ethernet/IP/TCP, detect TLS ClientHello, feed to JA3."""
+        if len(frame) < _ETH_HDR_LEN + 20:
+            return
+        # IPv4 header
+        ip_off = _ETH_HDR_LEN
+        ver_ihl = frame[ip_off]
+        if (ver_ihl >> 4) != 4:
+            return
+        ihl = (ver_ihl & 0x0f) * 4
+        if frame[ip_off + 9] != 6:  # protocol != TCP
+            return
+        src_ip = socket.inet_ntoa(frame[ip_off + 12:ip_off + 16])
+        dst_ip = socket.inet_ntoa(frame[ip_off + 16:ip_off + 20])
+
+        # TCP header
+        tcp_off = ip_off + ihl
+        if len(frame) < tcp_off + 20:
+            return
+        dst_port = struct.unpack("!H", frame[tcp_off + 2:tcp_off + 4])[0]
+        data_off = (frame[tcp_off + 12] >> 4) * 4
+        payload = frame[tcp_off + data_off:]
+
+        # TLS handshake record: content_type=22(0x16), version 0x03xx
+        if len(payload) < 6 or payload[0] != 0x16 or payload[1] != 0x03:
+            return
+        if payload[5] != 0x01:  # not a ClientHello
+            return
+
+        self._client_hellos += 1
+        result = self.process_packet(payload, src_ip=src_ip, dst_ip=dst_ip,
+                                     dst_port=dst_port)
+        if result and result.get("reason") == "MALICIOUS_JA3" and self.alert_system:
+            self.alert_system.send(result.get("alert_level", 3),
+                                   "MALICIOUS_JA3", result.get("detail", ""))
 
     def compute_ja3(self, client_hello: bytes) -> dict | None:
         """
@@ -258,6 +399,9 @@ class TLSFingerprint:
                         key=lambda x: len(x[1]), reverse=True)[:20]
 
             return {
+                "status": self.status,
+                "packets_seen": self._packets_seen,
+                "client_hellos": self._client_hellos,
                 "unique_fingerprints": unique,
                 "total_connections": total,
                 "malicious_hits": malicious,

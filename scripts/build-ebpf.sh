@@ -14,6 +14,10 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # eBPF 소스 디렉토리
 EDR_DIR="${PROJECT_ROOT}/xdr/ebpf-edr"
 NDR_DIR="${PROJECT_ROOT}/xdr/xdp-ndr"
+CORE_DIR="${PROJECT_ROOT}/xdr/xdr-core"
+
+# SSL 프로브 eBPF 빌드 플래그
+BPF_CFLAGS_SSL="-g -O2 -target bpf -D__TARGET_ARCH_x86 -I/usr/include -I/usr/include/bpf"
 
 # 배포 대상 디렉토리
 INSTALL_DIR="/opt/xdr"
@@ -97,6 +101,33 @@ build_component() {
     fi
 }
 
+# ─── 3b. SSL 프로브 빌드 (xdr-core, Makefile 없음 — 직접 컴파일) ──────────
+build_ssl_probe() {
+    log_info "────────────────────────────────────────"
+    log_info "SSL 프로브 (eBPF uprobe 평문 캡처) 빌드: ${CORE_DIR}/ssl_probe.bpf.c"
+
+    local src="${CORE_DIR}/ssl_probe.bpf.c"
+    local obj="${CORE_DIR}/ssl_probe.bpf.o"
+    local vmh="${CORE_DIR}/vmlinux.h"
+
+    if [[ ! -f "$src" ]]; then
+        log_err "SSL 프로브 소스 없음: $src"
+        return 1
+    fi
+    # vmlinux.h 보장
+    if [[ ! -f "$vmh" ]]; then
+        bpftool btf dump file /sys/kernel/btf/vmlinux format c > "$vmh"
+    fi
+
+    if clang $BPF_CFLAGS_SSL -I"${CORE_DIR}" -c "$src" -o "$obj"; then
+        log_ok "SSL 프로브 빌드 성공: $obj"
+        file "$obj"
+    else
+        log_err "SSL 프로브 빌드 실패"
+        return 1
+    fi
+}
+
 # ─── 4. 배포 설치 ────────────────────────────────────────────────────────
 install_objects() {
     log_info "────────────────────────────────────────"
@@ -112,6 +143,25 @@ install_objects() {
     if [[ -f "${NDR_DIR}/ndr.bpf.o" ]]; then
         sudo cp "${NDR_DIR}/ndr.bpf.o" "${INSTALL_DIR}/xdp-ndr/"
         log_ok "NDR 설치됨: ${INSTALL_DIR}/xdp-ndr/ndr.bpf.o"
+    fi
+
+    # BPF Guard 오브젝트 설치 (ebpf-edr/Makefile 의 all 타깃이 이미 빌드함).
+    # bpf_guard.py 는 /opt/xdr/xdr-core/bpf_guard.bpf.o 를 참조하므로 여기에 배치.
+    if [[ -f "${EDR_DIR}/bpf_guard.bpf.o" ]]; then
+        sudo mkdir -p "${INSTALL_DIR}/xdr-core"
+        sudo cp "${EDR_DIR}/bpf_guard.bpf.o" "${INSTALL_DIR}/xdr-core/"
+        log_ok "BPF Guard 설치됨: ${INSTALL_DIR}/xdr-core/bpf_guard.bpf.o"
+    else
+        log_warn "bpf_guard.bpf.o 없음 — BPF Guard 설치 건너뜀"
+    fi
+
+    # SSL 프로브 오브젝트 설치 (ssl_probe.py 가 /opt/xdr/xdr-core/ssl_probe.bpf.o 참조)
+    if [[ -f "${CORE_DIR}/ssl_probe.bpf.o" ]]; then
+        sudo mkdir -p "${INSTALL_DIR}/xdr-core"
+        sudo cp "${CORE_DIR}/ssl_probe.bpf.o" "${INSTALL_DIR}/xdr-core/"
+        log_ok "SSL 프로브 설치됨: ${INSTALL_DIR}/xdr-core/ssl_probe.bpf.o"
+    else
+        log_warn "ssl_probe.bpf.o 없음 — SSL 프로브 설치 건너뜀"
     fi
 
     # build-ebpf.sh 자체도 /opt/xdr 에 복사 (xdr_engine.py 참조 경로)
@@ -155,6 +205,7 @@ main() {
     local fail=0
     build_component "EDR (eBPF Endpoint Detection)" "$EDR_DIR" "edr.bpf.o" || fail=1
     build_component "NDR (XDP Network Detection)"   "$NDR_DIR" "ndr.bpf.o" || fail=1
+    build_ssl_probe || fail=1
 
     if [[ $fail -eq 0 ]]; then
         install_objects

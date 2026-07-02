@@ -142,7 +142,7 @@ def create_default_rules():
     RULES_DIR.mkdir(parents=True, exist_ok=True)
 
     default_rules = {
-        "reverse_shell.yar": '''
+        "reverse_shell.yar": r'''
 rule ReverseShell_Bash {
     meta:
         description = "Bash reverse shell patterns"
@@ -171,7 +171,7 @@ rule ReverseShell_Python {
         ($s1 and $s3) or ($s1 and $s2 and $rev)
 }
 ''',
-        "cryptominer.yar": '''
+        "cryptominer.yar": r'''
 rule CryptoMiner_Strings {
     meta:
         description = "Cryptocurrency miner indicators"
@@ -188,7 +188,7 @@ rule CryptoMiner_Strings {
         2 of them
 }
 ''',
-        "webshell.yar": '''
+        "webshell.yar": r'''
 rule WebShell_PHP {
     meta:
         description = "PHP webshell patterns"
@@ -203,7 +203,7 @@ rule WebShell_PHP {
         any of them
 }
 ''',
-        "suspicious.yar": '''
+        "suspicious.yar": r'''
 rule Suspicious_ELF_Packer {
     meta:
         description = "Packed/obfuscated ELF binary"

@@ -25,6 +25,7 @@ def api_client(tmp_path):
     except Exception:
         pytest.skip("Cannot import api.middleware (permission denied)")
 
+    import web_dashboard  # noqa: F401 — imports all api.routes_* (registers routes)
     import api
     api.app.config['TESTING'] = True
     client = api.app.test_client()
@@ -61,23 +62,32 @@ class TestAPIMiddleware:
 class TestCoreAPI:
     """Tests for core API endpoints."""
 
-    def test_status_endpoint(self, api_client):
+    def test_unauthenticated_request_rejected(self, api_client):
+        """Protected endpoints must reject requests without auth."""
         client, _ = api_client
         response = client.get("/api/status")
+        assert response.status_code == 401
+
+    def test_status_endpoint(self, api_client):
+        client, secret = api_client
+        headers = _make_hmac_headers(secret, "GET", "/api/status")
+        response = client.get("/api/status", headers=headers)
         assert response.status_code == 200
         data = json.loads(response.data)
         assert isinstance(data, dict)
 
     def test_events_endpoint(self, api_client):
-        client, _ = api_client
-        response = client.get("/api/events")
+        client, secret = api_client
+        headers = _make_hmac_headers(secret, "GET", "/api/events")
+        response = client.get("/api/events", headers=headers)
         assert response.status_code == 200
         data = json.loads(response.data)
         assert isinstance(data, (list, dict))
 
     def test_search_endpoint(self, api_client):
-        client, _ = api_client
-        response = client.get("/api/search?q=test")
+        client, secret = api_client
+        headers = _make_hmac_headers(secret, "GET", "/api/events/search")
+        response = client.get("/api/events/search?q=test", headers=headers)
         assert response.status_code == 200
 
 
@@ -94,5 +104,7 @@ class TestBlocklistAPI:
         }
         import api
         api.blocklist_store = mock_store
-        response = client.get("/api/blocklist")
+        _, secret = api_client
+        headers = _make_hmac_headers(secret, "GET", "/api/blocklists")
+        response = client.get("/api/blocklists", headers=headers)
         assert response.status_code == 200

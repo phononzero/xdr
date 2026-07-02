@@ -8,6 +8,7 @@ import logging
 from queue import Queue, Empty
 
 from flask import Response, request, jsonify
+import api
 from api import app, event_history, event_history_lock, sse_queues, sse_lock
 
 
@@ -100,11 +101,24 @@ def get_status():
     status["edr_loaded"] = edr_pins.exists() and any(edr_pins.iterdir())
 
     try:
-        result = subprocess.run(
-            ["ip", "link", "show", "enp4s0"],
-            capture_output=True, text=True, timeout=3
-        )
-        status["ndr_attached"] = "xdp" in result.stdout.lower()
+        # Use the NIC the engine actually resolved/attached to, not a
+        # hardcoded interface name (was always "enp4s0" → false negatives).
+        nic = None
+        if api._xdr_engine_ref is not None:
+            nic = getattr(api._xdr_engine_ref, "nic_interface", None)
+        if not nic:
+            try:
+                from nic_manager import resolve_nic
+                from config_loader import get_config
+                nic = resolve_nic(get_config()["engine"]["nic_interface"])
+            except Exception:
+                nic = None
+        if nic:
+            result = subprocess.run(
+                ["ip", "link", "show", nic],
+                capture_output=True, text=True, timeout=3
+            )
+            status["ndr_attached"] = "xdp" in result.stdout.lower()
     except Exception:
         pass
 

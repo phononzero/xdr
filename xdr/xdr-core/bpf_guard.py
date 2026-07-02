@@ -8,10 +8,11 @@ denied access attempts.
 
 Usage:
     guard = BPFGuard()
-    guard.load()                    # Load guard program
+    guard.load()                    # Load + auto-attach, pin maps
     guard.register_pid(os.getpid()) # Register XDR PID
     guard.enable()                  # Start enforcing
-    guard.monitor_denied()          # Watch for denied attempts
+    guard.get_stats()               # {"allowed": N, "denied": M, "enforcing": bool}
+    guard.get_denied_events()       # Drain recent denied bpf() attempts
 """
 
 import os
@@ -32,6 +33,50 @@ GUARD_OBJ_INSTALLED = Path("/opt/xdr/xdr-core/bpf_guard.bpf.o")
 # BPF map pin paths
 BPF_FS = Path("/sys/fs/bpf")
 PIN_DIR = BPF_FS / "xdr_guard"
+
+# bpf() syscall (x86_64) for in-process map reads. Reading via in-process bpf()
+# (rather than a bpftool subprocess) is essential: once the guard is ENFORCING,
+# a bpftool child is a different PID and gets denied — but the registered XDR
+# process itself is allowed, so it can still read guard_stats directly.
+_SYS_BPF = 321
+_BPF_MAP_LOOKUP_ELEM = 1
+_BPF_OBJ_GET = 7
+
+
+class _BpfObjGetAttr(ctypes.Structure):
+    _fields_ = [("pathname", ctypes.c_uint64),
+                ("bpf_fd", ctypes.c_uint32),
+                ("file_flags", ctypes.c_uint32)]
+
+
+class _BpfLookupAttr(ctypes.Structure):
+    _fields_ = [("map_fd", ctypes.c_uint32),
+                ("_pad", ctypes.c_uint32),
+                ("key", ctypes.c_uint64),
+                ("value", ctypes.c_uint64),
+                ("flags", ctypes.c_uint64)]
+
+
+def _bpf_obj_get(pin_path: str) -> int:
+    """bpf(BPF_OBJ_GET) — open a pinned map/prog, return fd or -1."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    buf = ctypes.create_string_buffer(pin_path.encode() + b"\x00")
+    attr = _BpfObjGetAttr(pathname=ctypes.addressof(buf))
+    fd = libc.syscall(_SYS_BPF, _BPF_OBJ_GET, ctypes.byref(attr),
+                      ctypes.sizeof(attr))
+    return fd
+
+
+def _map_lookup_u64(map_fd: int, index: int) -> int | None:
+    """bpf(BPF_MAP_LOOKUP_ELEM) on a u32-key / u64-value array map."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    key = ctypes.c_uint32(index)
+    val = ctypes.c_uint64(0)
+    attr = _BpfLookupAttr(map_fd=map_fd, key=ctypes.addressof(key),
+                          value=ctypes.addressof(val))
+    rc = libc.syscall(_SYS_BPF, _BPF_MAP_LOOKUP_ELEM, ctypes.byref(attr),
+                      ctypes.sizeof(attr))
+    return val.value if rc == 0 else None
 
 
 class BPFGuard:
@@ -56,36 +101,31 @@ class BPFGuard:
             return False
 
         try:
-            # Create pin directory
+            # Clean any stale pins from a previous run
+            if PIN_DIR.exists():
+                subprocess.run(["rm", "-rf", str(PIN_DIR)],
+                               capture_output=True, timeout=5)
             PIN_DIR.mkdir(parents=True, exist_ok=True)
 
-            # Load all programs from the object file
+            # Load + auto-attach the LSM programs AND pin the maps.
+            #   - autoattach: LSM programs must be attached via the kernel LSM
+            #     mechanism at load time; `bpftool prog attach ... lsm` is not a
+            #     valid attach type and always fails.
+            #   - pinmaps: pins guard_stats / guard_config / xdr_allowed_pids /
+            #     denied_events into PIN_DIR so register_pid/enable/get_stats
+            #     can reach them (loadall alone pins only programs).
             result = subprocess.run(
                 ["bpftool", "prog", "loadall", str(obj_path), str(PIN_DIR),
-                 "type", "lsm"],
-                capture_output=True, text=True, timeout=10
+                 "autoattach", "pinmaps", str(PIN_DIR)],
+                capture_output=True, text=True, timeout=15
             )
 
             if result.returncode != 0:
                 logger.error(f"Failed to load BPF Guard: {result.stderr}")
                 return False
 
-            # Attach LSM programs
-            for prog_name in ["guard_bpf", "guard_bpf_map", "guard_bpf_prog"]:
-                pin_path = PIN_DIR / prog_name
-                if pin_path.exists():
-                    attach_result = subprocess.run(
-                        ["bpftool", "prog", "attach", "pinned",
-                         str(pin_path), "lsm"],
-                        capture_output=True, text=True, timeout=10
-                    )
-                    if attach_result.returncode != 0:
-                        logger.warning(
-                            f"Failed to attach {prog_name}: {attach_result.stderr}"
-                        )
-
             self._loaded = True
-            logger.info("BPF Guard loaded successfully")
+            logger.info("BPF Guard loaded + attached (autoattach), maps pinned")
             return True
 
         except subprocess.TimeoutExpired:
@@ -100,51 +140,24 @@ class BPFGuard:
 
         Should be called with the XDR engine's PID before enabling enforcement.
         """
+        map_path = str(PIN_DIR / "xdr_allowed_pids")
+        # key = pid (u32 LE), value = 1 (u32 LE) → one hex token PER BYTE.
+        # (The old code did list(hexstring) which splits into nibble chars and
+        # bpftool rejects it.)
+        key_tokens = [f"{b:02x}" for b in struct.pack("<I", pid)]
+        val_tokens = [f"{b:02x}" for b in struct.pack("<I", 1)]
         try:
-            # Find the map fd via bpftool
-            result = subprocess.run(
-                ["bpftool", "map", "show", "pinned",
-                 str(PIN_DIR / "xdr_allowed_pids")],
-                capture_output=True, text=True, timeout=5
-            )
-
-            if result.returncode == 0:
-                # Update map: key=pid, value=1 (allowed)
-                key_hex = struct.pack("<I", pid).hex()
-                val_hex = struct.pack("<I", 1).hex()
-
-                update_result = subprocess.run(
-                    ["bpftool", "map", "update", "pinned",
-                     str(PIN_DIR / "xdr_allowed_pids"),
-                     "key", "hex"] + list(key_hex) + [
-                     "value", "hex"] + list(val_hex),
-                    capture_output=True, text=True, timeout=5
-                )
-
-                if update_result.returncode == 0:
-                    logger.info(f"BPF Guard: registered PID {pid} as allowed")
-                    return True
-                else:
-                    logger.error(
-                        f"Failed to register PID {pid}: {update_result.stderr}"
-                    )
-
-            # Fallback: use bpftool map update with different syntax
             update_result = subprocess.run(
-                ["bpftool", "map", "update", "pinned",
-                 str(PIN_DIR / "xdr_allowed_pids"),
-                 "key", str(pid), "0", "0", "0",
-                 "value", "1", "0", "0", "0"],
+                ["bpftool", "map", "update", "pinned", map_path,
+                 "key", "hex", *key_tokens,
+                 "value", "hex", *val_tokens],
                 capture_output=True, text=True, timeout=5
             )
-
             if update_result.returncode == 0:
                 logger.info(f"BPF Guard: registered PID {pid} as allowed")
                 return True
-
-            logger.error(f"Failed to register PID: {update_result.stderr}")
+            logger.error(f"Failed to register PID {pid}: {update_result.stderr}")
             return False
-
         except Exception as e:
             logger.error(f"BPF Guard register error: {e}")
             return False
@@ -195,21 +208,103 @@ class BPFGuard:
             return False
 
     def get_stats(self) -> dict:
-        """Get guard statistics (allowed/denied counts)."""
-        stats = {"allowed": 0, "denied": 0}
+        """Get guard statistics (allowed/denied counts).
+
+        guard_stats is an ARRAY map of 2x __u64: index0=allowed, index1=denied.
+        """
+        stats = {"allowed": 0, "denied": 0, "enforcing": self._enforcing}
+
+        # Primary: in-process bpf() read of the pinned array map. Works even
+        # while enforcing (this process is registered/allowed).
         try:
+            fd = _bpf_obj_get(str(PIN_DIR / "guard_stats"))
+            if fd >= 0:
+                a = _map_lookup_u64(fd, 0)
+                d = _map_lookup_u64(fd, 1)
+                os.close(fd)
+                if a is not None or d is not None:
+                    stats["allowed"] = int(a or 0)
+                    stats["denied"] = int(d or 0)
+                    return stats
+        except Exception as e:
+            logger.debug(f"Guard stats in-process read failed: {e}")
+
+        # Fallback: bpftool JSON dump (only works when NOT enforcing).
+        try:
+            import json
             result = subprocess.run(
-                ["bpftool", "map", "dump", "pinned",
+                ["bpftool", "-j", "map", "dump", "pinned",
                  str(PIN_DIR / "guard_stats")],
                 capture_output=True, text=True, timeout=5
             )
-            if result.returncode == 0:
-                # Parse bpftool output
-                lines = result.stdout.strip()
-                logger.debug(f"Guard stats raw: {lines}")
-        except Exception:
-            pass
+            if result.returncode != 0:
+                return stats
+            for e in json.loads(result.stdout):
+                fmt = e.get("formatted")
+                if fmt is not None:
+                    idx, val = fmt.get("key"), fmt.get("value")
+                else:
+                    kb = [int(x, 16) for x in e.get("key", [])]
+                    vb = [int(x, 16) for x in e.get("value", [])]
+                    idx = kb[0] if kb else None
+                    val = int.from_bytes(bytes(vb), "little") if vb else 0
+                if idx == 0:
+                    stats["allowed"] = int(val)
+                elif idx == 1:
+                    stats["denied"] = int(val)
+        except Exception as e:
+            logger.debug(f"Guard stats parse error: {e}")
         return stats
+
+    def get_denied_events(self, max_events: int = 64) -> list[dict]:
+        """Drain recent denied-bpf() attempts from the denied_events ring buffer.
+
+        Best-effort snapshot (consumes the ring buffer). Each entry:
+        {pid, uid, bpf_cmd, comm}. Returns [] if libbpf/map is unavailable.
+        """
+        events: list[dict] = []
+        try:
+            from engine.ring_buffer import RingBufferPoller
+        except Exception:
+            return events
+
+        class _DeniedEvent(ctypes.Structure):
+            _fields_ = [
+                ("pid", ctypes.c_uint32),
+                ("uid", ctypes.c_uint32),
+                ("bpf_cmd", ctypes.c_uint32),
+                ("comm", ctypes.c_char * 16),
+            ]
+
+        # Open the pinned ring buffer in-process (allowed under enforcement).
+        fd = _bpf_obj_get(str(PIN_DIR / "denied_events"))
+        if fd < 0:
+            return events
+
+        def _cb(ctx, data, size):
+            if size < ctypes.sizeof(_DeniedEvent) or len(events) >= max_events:
+                return 0
+            ev = _DeniedEvent.from_buffer_copy(
+                ctypes.string_at(data, ctypes.sizeof(_DeniedEvent)))
+            events.append({
+                "pid": ev.pid,
+                "uid": ev.uid,
+                "bpf_cmd": ev.bpf_cmd,
+                "comm": ev.comm.decode("utf-8", "replace").rstrip("\x00"),
+            })
+            return 0
+
+        try:
+            poller = RingBufferPoller()
+            if poller._lib and poller.attach_ringbuf(fd, _cb):
+                # Drain whatever is currently buffered (non-blocking-ish).
+                for _ in range(8):
+                    if poller.poll(timeout_ms=10) <= 0:
+                        break
+                poller.free()
+        except Exception as e:
+            logger.debug(f"Guard denied-events drain error: {e}")
+        return events
 
     def unload(self):
         """Unload the guard program and clean up pins."""

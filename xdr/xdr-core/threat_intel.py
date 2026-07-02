@@ -63,8 +63,16 @@ FEEDS = {
     },
 }
 
-# HTTP request timeout
+# HTTP request timeout + feed-update loop interval (from [threat_intel] config)
 _TIMEOUT = 15
+_UPDATE_INTERVAL = 300
+try:
+    from config_loader import get_config as _get_cfg
+    _ti_cfg = _get_cfg().get("threat_intel", {})
+    _TIMEOUT = _ti_cfg.get("request_timeout", _TIMEOUT)
+    _UPDATE_INTERVAL = _ti_cfg.get("update_interval", _UPDATE_INTERVAL)
+except Exception:
+    pass
 _USER_AGENT = "XDR-ThreatIntel/1.0"
 
 
@@ -387,7 +395,7 @@ class ThreatIntelFeed:
                 self.update_feeds()
             except Exception as e:
                 logger.warning(f"TI update error: {e}")
-            self._stop.wait(300)  # Check every 5 minutes
+            self._stop.wait(_UPDATE_INTERVAL)  # [threat_intel].update_interval
 
     # ── API helpers ──────────────────────────────────────
 

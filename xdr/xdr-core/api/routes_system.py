@@ -24,7 +24,9 @@ def _ip_int_to_str(ip_int: int) -> str:
     if ip_int == 0:
         return "0.0.0.0"
     try:
-        return socket.inet_ntoa(struct.pack("!I", ip_int))
+        # Native pack: dst_ip ints originate from eBPF (network-order bytes read
+        # as a native u32). See engine.utils.ip_str.
+        return socket.inet_ntoa(struct.pack("=I", ip_int & 0xFFFFFFFF))
     except (struct.error, OSError):
         return str(ip_int)
 
@@ -229,7 +231,9 @@ def get_connections():
                 peer_port = c.get("peer_port", 0)
                 # Convert peer IP string to int for cache lookup
                 try:
-                    ip_int = struct.unpack("!I", socket.inet_aton(peer))[0]
+                    # Match conn_cache keys, which store the raw eBPF dst_ip
+                    # (network-order bytes as a native u32) — unpack native.
+                    ip_int = struct.unpack("=I", socket.inet_aton(peer))[0]
                     dst_key = (ip_int, peer_port)
                     if dst_key in ccache:
                         cached = ccache[dst_key]

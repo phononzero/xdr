@@ -28,7 +28,12 @@ enum event_type {
     EVT_PROCESS_EXIT    = 6,
     EVT_MEMFD_CREATE    = 7,
     EVT_PTRACE          = 8,
+    EVT_CONTAINER_ESCAPE = 9,
 };
+
+// Container-escape syscall subtypes (carried in dst_port)
+#define CE_SETNS    1
+#define CE_UNSHARE  2
 
 // --- Event structure (sent to userspace) ---
 struct edr_event {
@@ -282,7 +287,16 @@ int BPF_PROG(lsm_file_open, struct file *file)
 
     // Only monitor root file access and specific sensitive files
     if (uid == 0) {
-        // Try to get the file path from dentry
+        // Reconstruct the FULL path via bpf_d_path (not just the leaf name),
+        // so userspace can match sensitive DIRECTORIES (/etc/ssh/, /root/.ssh/)
+        // and container-escape paths (/proc/1/root, docker.sock, release_agent).
+        char pbuf[MAX_PATH_LEN];
+        long plen = bpf_d_path(&file->f_path, pbuf, sizeof(pbuf));
+        if (plen >= 0) {
+            emit_event(EVT_FILE_OPEN, ALERT_INFO, pbuf, 0, 0, get_ppid());
+            return 0;
+        }
+        // Fallback: leaf name from dentry
         struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
         if (dentry) {
             const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
@@ -309,12 +323,47 @@ int BPF_PROG(lsm_module_request, char *kmod_name, int order, char *origin)
 // ============================================================
 // Hook 5: BPF LSM — Privilege Escalation Detection
 // ============================================================
+#define S_ISUID_BIT 0004000
+#define S_ISGID_BIT 0002000
+
 SEC("lsm/bprm_check_security")
 int BPF_PROG(lsm_bprm_check, struct linux_binprm *bprm)
 {
-    // Capture the binary path being executed with elevated privileges
-    const char *fname = BPF_CORE_READ(bprm, filename);
-    emit_event(EVT_PRIV_ESCALATION, ALERT_INFO, fname, 0, 0, get_ppid());
+    // Meaningful privilege escalation = a NON-root caller executing a
+    // setuid/setgid binary owned by root, which grants elevated privileges
+    // (su, sudo, passwd, mount, pkexec, or an attacker-planted setuid shell).
+    //
+    // NOTE: at bprm_check time the kernel has NOT yet applied the setuid euid
+    // to bprm->cred (it stays the caller's uid until commit), so we must
+    // inspect the *file inode* (setuid bit + owner) rather than the new euid.
+    // The previous "emit on every exec" behaviour was pure noise; this makes
+    // the priv-escalation correlation scenario meaningful.
+    __u32 cur_uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    if (cur_uid == 0)
+        return 0;  // already root — no escalation
+
+    struct file *file = BPF_CORE_READ(bprm, file);
+    if (!file)
+        return 0;
+
+    struct inode *inode = BPF_CORE_READ(file, f_inode);
+    if (!inode)
+        return 0;
+
+    umode_t mode = BPF_CORE_READ(inode, i_mode);
+    __u32 owner   = BPF_CORE_READ(inode, i_uid.val);
+
+    __u8 is_setuid = (mode & S_ISUID_BIT) != 0;
+    __u8 is_setgid = (mode & S_ISGID_BIT) != 0;
+
+    // setuid-root (owner==0) or setgid binary run by a non-root user
+    if ((is_setuid && owner == 0) || is_setgid) {
+        const char *fname = BPF_CORE_READ(bprm, filename);
+        // Carry the setuid/setgid flags in dst_port for userspace context.
+        __u16 flags = (is_setuid ? 1 : 0) | (is_setgid ? 2 : 0);
+        emit_event(EVT_PRIV_ESCALATION, ALERT_WARNING, fname, owner, flags,
+                   get_ppid());
+    }
     return 0;
 }
 
@@ -398,6 +447,36 @@ int trace_finit_module(struct trace_event_raw_sys_enter *ctx)
 
     // Store fd in dst_ip for reference
     emit_event(EVT_MODULE_LOAD, ALERT_CRITICAL, params, fd, 0, ppid);
+    return 0;
+}
+
+// ============================================================
+// Hook 11: setns — Namespace join (container escape primitive)
+// ============================================================
+SEC("tracepoint/syscalls/sys_enter_setns")
+int trace_setns(struct trace_event_raw_sys_enter *ctx)
+{
+    // setns(int fd, int nstype) — arg1 = nstype (CLONE_NEW* flags)
+    __u32 nstype = (__u32)ctx->args[1];
+    __u32 ppid = get_ppid();
+    // filename="setns", dst_ip=nstype, dst_port=CE_SETNS
+    emit_event(EVT_CONTAINER_ESCAPE, ALERT_WARNING, "setns",
+               nstype, CE_SETNS, ppid);
+    return 0;
+}
+
+// ============================================================
+// Hook 12: unshare — New namespace creation (escape/priv primitive)
+// ============================================================
+SEC("tracepoint/syscalls/sys_enter_unshare")
+int trace_unshare(struct trace_event_raw_sys_enter *ctx)
+{
+    // unshare(int flags) — arg0 = flags (CLONE_NEW* / CLONE_NEWUSER)
+    __u32 flags = (__u32)ctx->args[0];
+    __u32 ppid = get_ppid();
+    // filename="unshare", dst_ip=flags, dst_port=CE_UNSHARE
+    emit_event(EVT_CONTAINER_ESCAPE, ALERT_WARNING, "unshare",
+               flags, CE_UNSHARE, ppid);
     return 0;
 }
 

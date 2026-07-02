@@ -7,11 +7,19 @@ import socket
 
 
 def ip_str(ip_int: int) -> str:
-    """Convert a 32-bit integer IP to dotted string (IPv4)."""
+    """Convert a 32-bit integer IP to dotted string (IPv4).
+
+    The eBPF programs copy the kernel's __be32 address (skc_daddr / iph->daddr)
+    verbatim into the u32 field, so its in-memory bytes are already in network
+    order. ctypes reads that field with the host's native endianness, therefore
+    re-serializing with NATIVE endianness ('=I') recovers the original network-
+    order bytes. Using big-endian ('!I') here byte-reverses the address
+    (e.g. 203.0.113.5 → 5.113.0.203) and breaks threat-intel IP matching.
+    """
     if ip_int == 0:
         return "0.0.0.0"
     try:
-        return socket.inet_ntoa(struct.pack("!I", ip_int))
+        return socket.inet_ntoa(struct.pack("=I", ip_int & 0xFFFFFFFF))
     except (struct.error, OSError):
         return f"0x{ip_int:08x}"
 

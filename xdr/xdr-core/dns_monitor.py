@@ -51,6 +51,18 @@ DGA_MAX_NUM_RATIO = 0.3          # Maximum numeric character ratio
 DNS_TUNNEL_TXT_THRESHOLD = 10    # TXT queries per minute
 DNS_TUNNEL_SUBDOMAIN_LEN = 40    # Subdomain length for tunneling
 
+# Override thresholds from the [dns] config section (env/YAML), if present.
+try:
+    from config_loader import get_config as _get_cfg
+    _dns_cfg = _get_cfg().get("dns", {})
+    DGA_ENTROPY_THRESHOLD = _dns_cfg.get("dga_entropy_threshold", DGA_ENTROPY_THRESHOLD)
+    DGA_CONSONANT_RATIO = _dns_cfg.get("dga_consonant_ratio", DGA_CONSONANT_RATIO)
+    DGA_MIN_LENGTH = _dns_cfg.get("dga_min_length", DGA_MIN_LENGTH)
+    DNS_TUNNEL_TXT_THRESHOLD = _dns_cfg.get("tunnel_txt_threshold", DNS_TUNNEL_TXT_THRESHOLD)
+    DNS_TUNNEL_SUBDOMAIN_LEN = _dns_cfg.get("tunnel_subdomain_len", DNS_TUNNEL_SUBDOMAIN_LEN)
+except Exception:
+    pass
+
 
 def _shannon_entropy(s: str) -> float:
     """Calculate Shannon entropy of a string."""

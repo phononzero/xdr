@@ -9,6 +9,7 @@ from .ebpf_structs import (
     EVT_PROCESS_EXEC, EVT_FILE_OPEN, EVT_NET_CONNECT,
     EVT_MODULE_LOAD, EVT_PRIV_ESCALATION,
     EVT_PROCESS_EXIT, EVT_MEMFD_CREATE, EVT_PTRACE,
+    EVT_CONTAINER_ESCAPE, CE_SETNS, CE_UNSHARE,
     EVT_NAMES, NDR_EVT_NAMES,
 )
 from .ring_buffer import RingBufferPoller, get_map_fd_by_name
@@ -23,6 +24,7 @@ __all__ = [
     "EVT_PROCESS_EXEC", "EVT_FILE_OPEN", "EVT_NET_CONNECT",
     "EVT_MODULE_LOAD", "EVT_PRIV_ESCALATION",
     "EVT_PROCESS_EXIT", "EVT_MEMFD_CREATE", "EVT_PTRACE",
+    "EVT_CONTAINER_ESCAPE", "CE_SETNS", "CE_UNSHARE",
     "EVT_NAMES", "NDR_EVT_NAMES",
     "RingBufferPoller", "get_map_fd_by_name",
     "LogManager", "AlertSystem", "CorrelationEngine", "ip_str",
